@@ -1,54 +1,53 @@
 # Copyright (c) 2023 Boston Dynamics AI Institute LLC. All rights reserved.
 
 from dataclasses import dataclass
-from typing import Any, Dict, Union
+from typing import Any, Dict, List, Tuple, Union
 
 import numpy as np
 import torch
 from depth_camera_filtering import filter_depth
-from frontier_exploration.base_explorer import BaseExplorer
 from habitat.tasks.nav.object_nav_task import ObjectGoalSensor
 from habitat_baselines.common.baseline_registry import baseline_registry
 from habitat_baselines.common.tensor_dict import TensorDict
-from habitat_baselines.config.default_structured_configs import (
-    PolicyConfig,
-)
+from habitat_baselines.config.default_structured_configs import PolicyConfig
 from habitat_baselines.rl.ppo.policy import PolicyActionData
 from hydra.core.config_store import ConfigStore
 from omegaconf import DictConfig
 from torch import Tensor
 
-from vlfm.utils.geometry_utils import xyz_yaw_to_tf_matrix
-from vlfm.vlm.grounding_dino import ObjectDetections
+from myon.mapping.obstacle_map import ObstacleMap
+from myon.utils.geometry_utils import xyz_yaw_to_tf_matrix
+from myon.vlm.detections import ObjectDetections
 
-from ..mapping.obstacle_map import ObstacleMap
-from .base_objectnav_policy import BaseObjectNavPolicy, VLFMConfig
-from .itm_policy import ITMPolicy, ITMPolicyV2, ITMPolicyV3
+from .itm_policy_v2 import ITMPolicyV2
+from .qwen_policy import QwenPolicyV3
+from .simple_policy import ITMPolicy, MyonConfig, ObjectNavPolicy
+
 
 HM3D_ID_TO_NAME = ["chair", "bed", "potted plant", "toilet", "tv", "couch"]
-MP3D_ID_TO_NAME = [
-    "chair",
-    "table|dining table|coffee table|side table|desk",  # "table",
-    "framed photograph",  # "picture",
-    "cabinet",
-    "pillow",  # "cushion",
-    "couch",  # "sofa",
-    "bed",
-    "nightstand",  # "chest of drawers",
-    "potted plant",  # "plant",
-    "sink",
-    "toilet",
-    "stool",
-    "towel",
-    "tv",  # "tv monitor",
-    "shower",
-    "bathtub",
-    "counter",
-    "fireplace",
-    "gym equipment",
-    "seating",
-    "clothes",
-]
+# MP3D_ID_TO_NAME = [
+#     "chair",
+#     "table|dining table|coffee table|side table|desk",  # "table",
+#     "framed photograph",  # "picture",
+#     "cabinet",
+#     "pillow",  # "cushion",
+#     "couch",  # "sofa",
+#     "bed",
+#     "nightstand",  # "chest of drawers",
+#     "potted plant",  # "plant",
+#     "sink",
+#     "toilet",
+#     "stool",
+#     "towel",
+#     "tv",  # "tv monitor",
+#     "shower",
+#     "bathtub",
+#     "counter",
+#     "fireplace",
+#     "gym equipment",
+#     "seating",
+#     "clothes",
+# ]
 
 
 class TorchActionIDs:
@@ -59,14 +58,12 @@ class TorchActionIDs:
 
 
 class HabitatMixin:
-    """This Python mixin only contains code relevant for running a BaseObjectNavPolicy
-    explicitly within Habitat (vs. the real world, etc.) and will endow any parent class
-    (that is a subclass of BaseObjectNavPolicy) with the necessary methods to run in
-    Habitat.
+    """Habitat 环境适配层，负责将 ObjectNavPolicy 接入 Habitat 仿真器。
+    提供观测缓存、坐标变换、360° 初始化等功能。
     """
 
     _stop_action: Tensor = TorchActionIDs.STOP
-    _start_yaw: Union[float, None] = None  # must be set by _reset() method
+    _start_yaw: Union[float, None] = None  # 由 _reset() 设置
     _observations_cache: Dict[str, Any] = {}
     _policy_info: Dict[str, Any] = {}
     _compute_frontiers: bool = False
@@ -82,7 +79,6 @@ class HabitatMixin:
         *args: Any,
         **kwargs: Any,
     ) -> None:
-        print("doing mixin policy init")
         super().__init__(*args, **kwargs)
         self._camera_height = camera_height
         self._min_depth = min_depth
@@ -94,20 +90,20 @@ class HabitatMixin:
 
     @classmethod
     def from_config(cls, config: DictConfig, *args_unused: Any, **kwargs_unused: Any) -> "HabitatMixin":
-        policy_config: VLFMPolicyConfig = config.habitat_baselines.rl.policy
-        kwargs = {k: policy_config[k] for k in VLFMPolicyConfig.kwaarg_names}  # type: ignore
+        policy_config: SimplePolicyConfig = config.habitat_baselines.rl.policy
+        kwargs = {k: policy_config[k] for k in SimplePolicyConfig.kwaarg_names}  # type: ignore
 
-        # In habitat, we need the height of the camera to generate the camera transform
+        # 从 habitat 配置中提取相机参数
         sim_sensors_cfg = config.habitat.simulator.agents.main_agent.sim_sensors
         kwargs["camera_height"] = sim_sensors_cfg.rgb_sensor.position[1]
 
-        # Synchronize the mapping min/max depth values with the habitat config
+        # 同步深度参数
         kwargs["min_depth"] = sim_sensors_cfg.depth_sensor.min_depth
         kwargs["max_depth"] = sim_sensors_cfg.depth_sensor.max_depth
         kwargs["camera_fov"] = sim_sensors_cfg.depth_sensor.hfov
         kwargs["image_width"] = sim_sensors_cfg.depth_sensor.width
 
-        # Only bother visualizing if we're actually going to save the video
+        # 仅在需要保存视频时启用可视化
         kwargs["visualize"] = len(config.habitat_baselines.eval.video_option) > 0
 
         if "hm3d" in config.habitat.dataset.data_path:
@@ -120,24 +116,24 @@ class HabitatMixin:
         return cls(**kwargs)
 
     def act(
-        self: Union["HabitatMixin", BaseObjectNavPolicy],
+        self: Union["HabitatMixin", ObjectNavPolicy],
         observations: TensorDict,
         rnn_hidden_states: Any,
         prev_actions: Any,
         masks: Tensor,
         deterministic: bool = False,
     ) -> PolicyActionData:
-        """Converts object ID to string name, returns action as PolicyActionData"""
+        """将数字类别 ID 转为字符串名称，返回 PolicyActionData"""
         object_id: int = observations[ObjectGoalSensor.cls_uuid][0].item()
         obs_dict = observations.to_tree()
         if self._dataset_type == "hm3d":
             obs_dict[ObjectGoalSensor.cls_uuid] = HM3D_ID_TO_NAME[object_id]
-        elif self._dataset_type == "mp3d":
-            obs_dict[ObjectGoalSensor.cls_uuid] = MP3D_ID_TO_NAME[object_id]
-            self._non_coco_caption = " . ".join(MP3D_ID_TO_NAME).replace("|", " . ") + " ."
+        # elif self._dataset_type == "mp3d":
+        #     obs_dict[ObjectGoalSensor.cls_uuid] = MP3D_ID_TO_NAME[object_id]
+        #     self._non_coco_caption = " . ".join(MP3D_ID_TO_NAME).replace("|", " . ") + " ."
         else:
             raise ValueError(f"Dataset type {self._dataset_type} not recognized")
-        parent_cls: BaseObjectNavPolicy = super()  # type: ignore
+        parent_cls: ObjectNavPolicy = super()  # type: ignore
         try:
             action, rnn_hidden_states = parent_cls.act(obs_dict, rnn_hidden_states, prev_actions, masks, deterministic)
         except StopIteration:
@@ -149,18 +145,18 @@ class HabitatMixin:
         )
 
     def _initialize(self) -> Tensor:
-        """Turn left 30 degrees 12 times to get a 360 view at the beginning"""
+        """向左转 30 度，共 12 次完成 360° 初始化"""
         self._done_initializing = not self._num_steps < 11  # type: ignore
         return TorchActionIDs.TURN_LEFT
 
     def _reset(self) -> None:
-        parent_cls: BaseObjectNavPolicy = super()  # type: ignore
+        parent_cls: ObjectNavPolicy = super()  # type: ignore
         parent_cls._reset()
         self._start_yaw = None
 
     def _get_policy_info(self, detections: ObjectDetections) -> Dict[str, Any]:
-        """Get policy info for logging"""
-        parent_cls: BaseObjectNavPolicy = super()  # type: ignore
+        """获取策略信息用于日志记录"""
+        parent_cls: ObjectNavPolicy = super()  # type: ignore
         info = parent_cls._get_policy_info(detections)
 
         if not self._visualize:  # type: ignore
@@ -171,11 +167,11 @@ class HabitatMixin:
         info["start_yaw"] = self._start_yaw
         return info
 
-    def _cache_observations(self: Union["HabitatMixin", BaseObjectNavPolicy], observations: TensorDict) -> None:
-        """Caches the rgb, depth, and camera transform from the observations.
+    def _cache_observations(self: Union["HabitatMixin", ObjectNavPolicy], observations: TensorDict) -> None:
+        """缓存 RGB、深度图和相机变换矩阵。
 
         Args:
-           observations (TensorDict): The observations from the current timestep.
+           observations (TensorDict): 当前时间步的观测。
         """
         if len(self._observations_cache) > 0:
             return
@@ -184,7 +180,7 @@ class HabitatMixin:
         x, y = observations["gps"][0].cpu().numpy()
         camera_yaw = observations["compass"][0].cpu().item()
         depth = filter_depth(depth.reshape(depth.shape[:2]), blur_type=None)
-        # Habitat GPS makes west negative, so flip y
+        # Habitat GPS 的西方向为负，因此翻转 y
         camera_position = np.array([x, -y, self._camera_height])
         robot_xy = camera_position[:2]
         tf_camera_to_episodic = xyz_yaw_to_tf_matrix(camera_position, camera_yaw)
@@ -239,48 +235,28 @@ class HabitatMixin:
 
 
 @baseline_registry.register_policy
-class OracleFBEPolicy(HabitatMixin, BaseObjectNavPolicy):
-    def _explore(self, observations: TensorDict) -> Tensor:
-        explorer_key = [k for k in observations.keys() if k.endswith("_explorer")][0]
-        pointnav_action = observations[explorer_key]
-        return pointnav_action
-
-
-@baseline_registry.register_policy
-class SuperOracleFBEPolicy(HabitatMixin, BaseObjectNavPolicy):
-    def act(
-        self,
-        observations: TensorDict,
-        rnn_hidden_states: Any,  # can be anything because it is not used
-        *args: Any,
-        **kwargs: Any,
-    ) -> PolicyActionData:
-        return PolicyActionData(
-            actions=observations[BaseExplorer.cls_uuid],
-            rnn_hidden_states=rnn_hidden_states,
-            policy_info=[self._policy_info],
-        )
-
-
-@baseline_registry.register_policy
-class HabitatITMPolicy(HabitatMixin, ITMPolicy):
+class HabitatSimplePolicy(HabitatMixin, ITMPolicy):
     pass
 
 
 @baseline_registry.register_policy
-class HabitatITMPolicyV2(HabitatMixin, ITMPolicyV2):
+class HabitatSimplePolicyV2(HabitatMixin, ITMPolicyV2):
     pass
 
 
 @baseline_registry.register_policy
-class HabitatITMPolicyV3(HabitatMixin, ITMPolicyV3):
+class HabitatQwenPolicyV3(HabitatMixin, QwenPolicyV3):
     pass
 
 
 @dataclass
-class VLFMPolicyConfig(VLFMConfig, PolicyConfig):
-    pass
+class SimplePolicyConfig(MyonConfig, PolicyConfig):
+    name: str = "HabitatSimplePolicy"
 
 
 cs = ConfigStore.instance()
-cs.store(group="habitat_baselines/rl/policy", name="vlfm_policy", node=VLFMPolicyConfig)
+cs.store(
+    group="habitat_baselines/rl/policy",
+    name="simple_policy",
+    node=SimplePolicyConfig,
+)

@@ -192,7 +192,7 @@ class BaseITMPolicy(BaseObjectNavPolicy):
         all_rgb = [i[0] for i in self._observations_cache["value_map_rgbd"]]
         cosines = [
             [
-                self._itm.cosine(
+                self._itm.cosine( #BLIP2ITMClient 实例，计算文本和图像的余弦相似度
                     rgb,
                     p.replace("target_object", self._target_object.replace("|", "/")),
                 )
