@@ -80,6 +80,7 @@ class ITMPolicyV2(ITMPolicy):
 
                 if last_is_stuck:
                     self._block_frontier(last_frontier)
+                    print(f"Last frontier is stuck. Blocking it {self._blocked_frontier_cooldown} steps and choosing a new one.")
 
         # 选非循环且未被 加入黑名单 的最优前沿
         if best_frontier_idx is None:
@@ -121,6 +122,7 @@ class ITMPolicyV2(ITMPolicy):
             curr_value = sorted_values[last_idx]
             value_gap = best_value - curr_value
 
+
             should_stick = (
                 self._frontier_commit_steps < self._min_commit_steps
                 or value_gap < self._switch_margin
@@ -146,6 +148,13 @@ class ITMPolicyV2(ITMPolicy):
     
     def _is_frontier_stuck(self, frontier: np.ndarray) -> bool:
 
+        """
+        检查机器人是否在追踪当前前沿时卡住了。
+        卡住的条件：
+        1. 机器人距离前沿小于 frontier_reached_radius → 已到达
+        2. 连续多步未接近当前追踪的前沿 → 卡
+        3. 机器人运动不足 → 卡"""
+
         robot_xy = self._observations_cache["robot_xy"]
         dist = np.linalg.norm(frontier - robot_xy)
 
@@ -166,25 +175,25 @@ class ITMPolicyV2(ITMPolicy):
         self._last_robot_xy_for_frontier = None
 
     def _block_frontier(self, frontier: np.ndarray) -> None:
-        """将前沿加入黑名单, cooldown 步内不可再选。"""
+        """将前沿加入黑名单，cooldown 步内不可再选。"""
+        if self._is_frontier_blocked(frontier):
+            return
+
         unblock_step = self._num_steps + self._blocked_frontier_cooldown
         self._blocked_frontiers.append((frontier.copy(), unblock_step))
 
+
     def _is_frontier_blocked(self, frontier: np.ndarray) -> bool:
-        """检查前沿是否在黑名单中（按空间距离 + 步数冷却）。"""
-
-        if self._is_frontier_blocked(frontier):
-            return  # 已经在黑名单中，无需重复添加
-
-        # 清理过期的黑名单条目
-        active_blocks = []
-        for blocked_frontier, unblock_step in self._blocked_frontiers:
-            if self._num_steps <= unblock_step:
-                active_blocks.append((blocked_frontier, unblock_step))
-        self._blocked_frontiers = active_blocks
+        """检查前沿是否在黑名单中。"""
+        self._blocked_frontiers = [
+            (blocked_frontier, unblock_step)
+            for blocked_frontier, unblock_step in self._blocked_frontiers
+            if self._num_steps < unblock_step
+        ]
 
         return any(
-            np.linalg.norm(frontier - blocked_frontier) < self._blocked_frontier_radius
+            np.linalg.norm(frontier - blocked_frontier)
+            < self._blocked_frontier_radius
             for blocked_frontier, _ in self._blocked_frontiers
         )
 

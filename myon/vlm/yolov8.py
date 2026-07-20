@@ -13,13 +13,6 @@ from vlfm.vlm.server_wrapper import (
     str_to_image,
 )
 
-try:
-    from ultralytics import YOLO
-except ImportError:
-    print("Could not import ultralytics. This is OK if you are only using the client.")
-    YOLO = None  # type: ignore
-
-
 class YOLOv8:
     """YOLOv8 object detector, replacement for YOLOv7.
 
@@ -32,6 +25,8 @@ class YOLOv8:
         image_size: int = 640,
         device: Optional[torch.device] = None,
     ):
+        from ultralytics import YOLO
+
         if device is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.device = device

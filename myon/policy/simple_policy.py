@@ -1,5 +1,6 @@
 # Copyright (c) 2023 Boston Dynamics AI Institute LLC. All rights reserved.
 
+import json
 import os
 from dataclasses import dataclass, fields
 from typing import Any, Dict, List, Tuple, Union
@@ -8,6 +9,7 @@ import cv2
 import numpy as np
 import torch
 from hydra.core.config_store import ConfigStore
+from habitat.core.logging import logger
 from torch import Tensor
 
 from myon.mapping.object_point_cloud_map import ObjectPointCloudMap
@@ -21,6 +23,7 @@ from myon.vlm.blip2itm import BLIP2ITMClient
 from myon.vlm.detections import ObjectDetections
 from myon.vlm.sam import MobileSAMClient
 from myon.vlm.yolov8 import YOLOv8Client
+from vlfm.vlm.qwen_vl import QwenVLClient
 
 
 try:
@@ -59,12 +62,28 @@ class ObjectNavPolicy(BaseObjectNavPolicy):
         hole_area_thresh: int = 100000,
         coco_threshold: float = 0.8,
         non_coco_threshold: float = 0.4,
+        use_vqa_verification: bool = False,
+        vqa_trigger_threshold: float = 0.5,
+        vqa_positive_yolo_threshold: float = 0.7,
+        vqa_negative_yolo_threshold: float = 0.9,
+        vqa_fail_open: bool = False,
         *args: Any,
         **kwargs: Any,
     ) -> None:
         super().__init__()
+        if not (
+            0.0 <= vqa_trigger_threshold
+            <= vqa_positive_yolo_threshold
+            <= vqa_negative_yolo_threshold
+            <= 1.0
+        ):
+            raise ValueError(
+                "VQA thresholds must satisfy 0 <= trigger <= positive <= negative <= 1"
+            )
         self._coco_object_detector = YOLOv8Client(port=int(os.environ.get("YOLOV8_PORT", "12186")))
         self._mobile_sam = MobileSAMClient(port=int(os.environ.get("SAM_PORT", "12183")))
+        vqa_port = int(os.environ.get("QWEN_VQA_PORT", "12184"))
+        self._vqa_verifier = QwenVLClient(port=vqa_port) if use_vqa_verification else None
 
         self._pointnav_policy = WrappedPointNavResNetPolicy(pointnav_policy_path)
         self._object_map: ObjectPointCloudMap = ObjectPointCloudMap(erosion_size=object_map_erosion_size)
@@ -73,6 +92,13 @@ class ObjectNavPolicy(BaseObjectNavPolicy):
         self._visualize = visualize
         self._coco_threshold = coco_threshold
         self._non_coco_threshold = non_coco_threshold
+        self._use_vqa_verification = use_vqa_verification
+        self._vqa_trigger_threshold = vqa_trigger_threshold
+        self._vqa_positive_yolo_threshold = vqa_positive_yolo_threshold
+        self._vqa_negative_yolo_threshold = vqa_negative_yolo_threshold
+        self._vqa_fail_open = vqa_fail_open
+        self._vqa_verifications: List[Dict[str, Any]] = []
+        self._vqa_step_info: Dict[str, Any] = {}
 
         self._num_steps = 0
         self._did_reset = False
@@ -105,6 +131,7 @@ class ObjectNavPolicy(BaseObjectNavPolicy):
             self._update_object_map(rgb, depth, tf, min_depth, max_depth, fx, fy)
             for (rgb, depth, tf, min_depth, max_depth, fx, fy) in object_map_rgbd
         ]
+        self._log_vqa_step()
         robot_xy = self._observations_cache["robot_xy"]
         goal = self._get_target_object_location(robot_xy)
 
@@ -152,6 +179,8 @@ class ObjectNavPolicy(BaseObjectNavPolicy):
         self._num_steps = 0
         self._done_initializing = False
         self._called_stop = False
+        self._vqa_verifications = []
+        self._vqa_step_info = {}
         if self._compute_frontiers:
             self._obstacle_map.reset()
         self._did_reset = True
@@ -186,6 +215,9 @@ class ObjectNavPolicy(BaseObjectNavPolicy):
                 "target_object",
             ],
         }
+        if self._use_vqa_verification:
+            policy_info["vqa_verifications"] = self._vqa_verifications
+            policy_info["vqa_step"] = self._vqa_step_info
 
         if not self._visualize:
             return policy_info
@@ -211,12 +243,155 @@ class ObjectNavPolicy(BaseObjectNavPolicy):
 
         return policy_info
 
+    def _set_vqa_step_info(
+        self,
+        *,
+        triggered: bool,
+        result: str,
+        accepted_count: int,
+        max_yolo_confidence: Union[float, None] = None,
+        selected_threshold: Union[float, None] = None,
+        raw: str = "",
+        error: str = "",
+    ) -> None:
+        self._vqa_step_info = {
+            "step": self._num_steps,
+            "target": self._target_object.split("|")[0],
+            "enabled": self._use_vqa_verification,
+            "triggered": triggered,
+            "result": result,
+            "verified": True if result == "YES" else False if result == "NO" else None,
+            "max_yolo_confidence": max_yolo_confidence,
+            "selected_threshold": selected_threshold,
+            "accepted_count": accepted_count,
+            "target_detected_this_step": accepted_count > 0,
+            "raw": raw,
+            "error": error,
+        }
+        self._vqa_verifications = [self._vqa_step_info]
+
+    def _log_vqa_step(self) -> None:
+        if not self._use_vqa_verification:
+            return
+
+        target_in_object_map = self._object_map.has_object(self._target_object)
+        detected_this_step = self._vqa_step_info["target_detected_this_step"]
+        if detected_this_step:
+            final_decision = "TARGET_ACCEPTED_THIS_STEP"
+        elif target_in_object_map:
+            final_decision = "TARGET_ALREADY_MAPPED"
+        else:
+            final_decision = "NO_TARGET"
+
+        self._vqa_step_info.update(
+            {
+                "target_in_object_map": target_in_object_map,
+                "final_target_recognized": detected_this_step or target_in_object_map,
+                "final_decision": final_decision,
+            }
+        )
+        log_info = {
+            "step": self._vqa_step_info["step"],
+            "target": self._vqa_step_info["target"],
+            "vqa_triggered": self._vqa_step_info["triggered"],
+            "vqa_result": self._vqa_step_info["result"],
+            "target_detected_this_step": detected_this_step,
+            "final_target_recognized": self._vqa_step_info["final_target_recognized"],
+            "final_decision": final_decision,
+        }
+        for key in (
+            "max_yolo_confidence",
+            "selected_threshold",
+            "accepted_count",
+            "raw",
+            "error",
+        ):
+            value = self._vqa_step_info[key]
+            if value not in (None, ""):
+                log_info[key] = value
+        logger.info(f"[VQA_STEP] {json.dumps(log_info, sort_keys=True)}")
+
     def _get_object_detections(self, img: np.ndarray) -> ObjectDetections:
+        if self._use_vqa_verification and self._object_map.has_object(self._target_object):
+            self._set_vqa_step_info(
+                triggered=False,
+                result="SKIPPED_ALREADY_MAPPED",
+                accepted_count=0,
+            )
+            return ObjectDetections(
+                boxes=torch.empty((0, 4)),
+                logits=torch.empty(0),
+                phrases=[],
+                image_source=img,
+                fmt="xyxy",
+            )
+
         target_classes = self._target_object.split("|")
 
-        detections = self._coco_object_detector.predict(img)
+        if self._use_vqa_verification:
+            detections = self._coco_object_detector.predict(
+                img,
+                conf_thres=self._vqa_trigger_threshold,
+            )
+        else:
+            detections = self._coco_object_detector.predict(img)
         detections.filter_by_class(target_classes)
-        detections.filter_by_conf(0.8)
+
+        if not self._use_vqa_verification:
+            detections.filter_by_conf(self._coco_threshold)
+            self._vqa_step_info = {}
+            self._vqa_verifications = []
+            return detections
+
+        if detections.num_detections == 0:
+            self._set_vqa_step_info(
+                triggered=False,
+                result="NOT_TRIGGERED",
+                accepted_count=0,
+            )
+            return detections
+
+        max_confidence = float(detections.logits.max().item())
+        if max_confidence < self._vqa_trigger_threshold:
+            detections.filter_by_conf(self._vqa_trigger_threshold)
+            self._set_vqa_step_info(
+                triggered=False,
+                result="NOT_TRIGGERED",
+                accepted_count=0,
+                max_yolo_confidence=max_confidence,
+            )
+            return detections
+
+        verified: Union[bool, None] = None
+        use_positive_threshold = self._vqa_fail_open
+        raw_response = ""
+        error = ""
+        try:
+            if self._vqa_verifier is None:
+                raise RuntimeError("VQA verifier is not configured")
+            result = self._vqa_verifier.verify_detection(img, target_classes[0])
+            verified = bool(result["verified"])
+            use_positive_threshold = verified
+            raw_response = str(result.get("raw", ""))
+        except Exception as exc:
+            error = str(exc)
+
+        selected_threshold = (
+            self._vqa_positive_yolo_threshold
+            if use_positive_threshold
+            else self._vqa_negative_yolo_threshold
+        )
+        detections.filter_by_conf(selected_threshold)
+        result_name = "ERROR" if verified is None else ("YES" if verified else "NO")
+        self._set_vqa_step_info(
+            triggered=True,
+            result=result_name,
+            accepted_count=detections.num_detections,
+            max_yolo_confidence=max_confidence,
+            selected_threshold=selected_threshold,
+            raw=raw_response,
+            error=error,
+        )
 
         return detections
 
@@ -555,6 +730,19 @@ class MyonConfig:
     coco_threshold: float = 0.8
     non_coco_threshold: float = 0.4
     agent_radius: float = 0.18
+    min_commit_steps: int = 4
+    switch_margin: float = 0.05
+    stuck_patience: int = 20
+    frontier_reached_radius: float = 0.45
+    frontier_progress_epsilon: float = 0.1
+    robot_motion_epsilon: float = 0.03
+    blocked_frontier_radius: float = 0.6
+    blocked_frontier_cooldown: int = 30
+    use_vqa_verification: bool = False
+    vqa_trigger_threshold: float = 0.5
+    vqa_positive_yolo_threshold: float = 0.7
+    vqa_negative_yolo_threshold: float = 0.9
+    vqa_fail_open: bool = False
 
     @classmethod
     @property

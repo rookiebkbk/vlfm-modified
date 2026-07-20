@@ -38,7 +38,11 @@ from omegaconf import OmegaConf
 
 
 def extract_scalars_from_info(info: Dict[str, Any]) -> Dict[str, float]:
-    info_filtered = {k: v for k, v in info.items() if not isinstance(v, list)}
+    info_filtered = {
+        k: v
+        for k, v in info.items()
+        if not isinstance(v, list) and k != "vqa_step"
+    }
     return extract_scalars_from_info_habitat(info_filtered)
 
 
@@ -194,6 +198,8 @@ class VLFMTrainer(PPOTrainer):
                         "rho_theta": [float(x) for x in rho_theta_raw] if hasattr(rho_theta_raw, '__len__') and len(rho_theta_raw) > 0 else None,
                         "stop_called": bool(policy_info.get("stop_called", False)),
                     }
+                    if "vqa_step" in policy_info:
+                        step_data["vqa"] = policy_info["vqa_step"]
                     episode_step_buffers[0].append(step_data)
 
                 #更新点导航策略的隐藏状态和 prev_actions

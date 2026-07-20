@@ -186,3 +186,19 @@ habitat-lab/
 GroundingDINO/
 __pycache__/
 *.pyc
+
+# Local model checkpoints, datasets, and experiment artifacts.
+# These files are large and must be downloaded/generated separately.
+data/datasets/
+data/scene_datasets/
+data/*.pt
+data/*.pth
+outputs/
+tb/
+qwen/
+traced_model.pt
+yolov8x.pt
+yolov7/
+yolov7
+lockfiles/
+.claude/

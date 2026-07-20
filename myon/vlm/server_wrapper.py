@@ -55,8 +55,10 @@ def str_to_bool_arr(s: str, shape: tuple) -> np.ndarray:
 
 
 def image_to_str(img_np: np.ndarray, quality: float = 90.0) -> str:
-    encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), quality]
+    encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)]
     retval, buffer = cv2.imencode(".jpg", img_np, encode_param)
+    if not retval:
+        raise ValueError("Failed to encode image as JPEG")
     img_str = base64.b64encode(buffer).decode("utf-8")
     return img_str
 

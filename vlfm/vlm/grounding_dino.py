@@ -10,11 +10,6 @@ from vlfm.vlm.detections import ObjectDetections
 
 from .server_wrapper import ServerMixin, host_model, send_request, str_to_image
 
-try:
-    from groundingdino.util.inference import load_model, predict
-except ModuleNotFoundError:
-    print("Could not import groundingdino. This is OK if you are only using the client.")
-
 GROUNDING_DINO_CONFIG = "GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py"
 GROUNDING_DINO_WEIGHTS = "data/groundingdino_swint_ogc.pth"
 CLASSES = "chair . person . dog ."  # Default classes. Can be overridden at inference.
@@ -30,7 +25,10 @@ class GroundingDINO:
         text_threshold: float = 0.25,
         device: torch.device = torch.device("cuda"),
     ):
+        from groundingdino.util.inference import load_model, predict
+
         self.model = load_model(model_config_path=config_path, model_checkpoint_path=weights_path).to(device)
+        self._predict = predict
         self.caption = caption
         self.box_threshold = box_threshold
         self.text_threshold = text_threshold
@@ -58,7 +56,7 @@ class GroundingDINO:
             caption_to_use = caption
         print("Caption:", caption_to_use)
         with torch.inference_mode():
-            boxes, logits, phrases = predict(
+            boxes, logits, phrases = self._predict(
                 model=self.model,
                 image=image_transformed,
                 caption=caption_to_use,

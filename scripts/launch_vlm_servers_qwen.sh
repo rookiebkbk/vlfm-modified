@@ -1,33 +1,27 @@
 #!/usr/bin/env bash
 # Copyright [2023] Boston Dynamics AI Institute, Inc.
 #
-# 启动 YOLOv8 + Qwen3-VL (vLLM) + MobileSAM 三个服务。
+# 启动 YOLOv8 + Qwen3-VL (transformers/Flask) + MobileSAM 三个服务。
 #
 # Qwen3-VL 替代了原有的 BLIP2 (VQA) 和 BLIP2ITM (image-text matching)，
-# 使用 vLLM 的 OpenAI 兼容 API 提供服务。
+# 使用 transformers 直接加载 + Flask 提供服务（与 BLIP2/ITM 相同架构）。
 #
 # 显存策略（RTX 4090 24GB 单卡）:
-#   - Qwen3-VL-8B 先启动，占 ~16GB 模型权重 + ~3GB KV cache
+#   - Qwen3-VL-8B 先启动，占 ~16GB (bf16)
 #   - YOLOv8x 后启动，占 ~400MB
 #   - MobileSAM 后启动，占 ~200MB
-#   - 总计约 19.6GB / 24GB
-#
-# 前置条件:
-#   conda create -n vllm_service python=3.10 -y
-#   conda activate vllm_service
-#   pip install vllm qwen-vl-utils modelscope
-#   modelscope download --model Qwen/Qwen3-VL-8B-Instruct --local_dir /root/objnav/vlfm/qwen
+#   - 总计约 16.6GB / 24GB
 
 # ---- 环境变量 ----
 
-# Python 解释器（用于 YOLOv8 和 MobileSAM）
+# Python 解释器（用于 YOLOv8 和 MobileSAM，vlfm 环境）
 export VLFM_PYTHON=${VLFM_PYTHON:-`which python`}
 
-# vLLM 可执行文件路径（vllm_service 环境）
-export VLLM_EXEC=${VLLM_EXEC:-/root/anaconda3/envs/vllm_service/bin/vllm}
+# Python 解释器（用于 Qwen3-VL，vllm_service 环境提供新版 torch/transformers）
+export QWEN_PYTHON=${QWEN_PYTHON:-/root/anaconda3/envs/vllm_service/bin/python}
 
 # Qwen3-VL 模型路径
-export QWEN_MODEL_PATH=${QWEN_MODEL_PATH:-/root/objnav/vlfm/qwen}
+export QWEN_MODEL_PATH=${QWEN_MODEL_PATH:-/root/objnav/vlfm/qwen/qwen3-vl-8B}
 
 # MobileSAM 模型权重
 export MOBILE_SAM_CHECKPOINT=${MOBILE_SAM_CHECKPOINT:-data/mobile_sam.pt}
@@ -40,10 +34,6 @@ export YOLOV8_PORT=${YOLOV8_PORT:-12186}
 export QWEN_PORT=${QWEN_PORT:-12182}      # Qwen3-VL 替代 BLIP2ITM (原端口 12182)
 export SAM_PORT=${SAM_PORT:-12183}
 
-# ---- GPU 配置 ----
-# vLLM 的 GPU 显存使用比例。RTX 4090 24GB: 0.80 = 19.2GB 给 vLLM
-export QWEN_GPU_MEMORY=${QWEN_GPU_MEMORY:-0.80}
-
 session_name=vlm_servers_qwen_${RANDOM}
 
 echo "============================================"
@@ -52,8 +42,8 @@ echo "============================================"
 echo ""
 echo "Session:  ${session_name}"
 echo ""
-echo "Services (start order for GPU memory):"
-echo "  1. Qwen3-VL    port ${QWEN_PORT}  (vLLM, GPU mem: ${QWEN_GPU_MEMORY})"
+echo "Services (Qwen starts first for GPU memory):"
+echo "  1. Qwen3-VL    port ${QWEN_PORT}  (transformers/Flask)"
 echo "  2. YOLOv8      port ${YOLOV8_PORT}"
 echo "  3. MobileSAM   port ${SAM_PORT}"
 echo ""
@@ -74,14 +64,18 @@ if [ ! -d "${QWEN_MODEL_PATH}" ]; then
     exit 1
 fi
 
-if [ ! -f "${VLLM_EXEC}" ]; then
-    echo "ERROR: vLLM not found at ${VLLM_EXEC}"
-    echo "  Install it first:"
-    echo "  conda create -n vllm_service python=3.10 -y"
-    echo "  conda activate vllm_service"
-    echo "  pip install vllm qwen-vl-utils"
+if [ ! -f "${QWEN_PYTHON}" ]; then
+    echo "ERROR: QWEN_PYTHON not found at ${QWEN_PYTHON}"
+    echo "  Ensure the vllm_service conda environment exists with transformers installed."
     exit 1
 fi
+
+for service_port in "${QWEN_PORT}" "${YOLOV8_PORT}" "${SAM_PORT}"; do
+    if ss -lnt | grep -q ":${service_port} "; then
+        echo "ERROR: port ${service_port} is already in use. Stop the old VLM server session first."
+        exit 1
+    fi
+done
 
 # ---- 创建 tmux 会话 ----
 tmux new-session -d -s ${session_name}
@@ -94,26 +88,25 @@ tmux split-window -h -t ${session_name}:0.0
 
 # ---- 启动服务（Qwen 先启动以抢占显存） ----
 
-# Pane 0.0: Qwen3-VL via vLLM (先启动，占 ~16GB 模型 + ~3GB KV cache)
+# Pane 0.0: Qwen3-VL via transformers/Flask (先启动，占 ~16GB)
 tmux send-keys -t ${session_name}:0.0 \
-    "echo '=== Qwen3-VL via vLLM (port ${QWEN_PORT}) ===' && ${VLLM_EXEC} serve ${QWEN_MODEL_PATH} --port ${QWEN_PORT} --gpu-memory-utilization ${QWEN_GPU_MEMORY} --max-model-len 4096 --enforce-eager" C-m
+    "echo '=== Qwen3-VL (port ${QWEN_PORT}) ===' && ${QWEN_PYTHON} -m vlfm.vlm.qwen_vl --port ${QWEN_PORT} --model-path ${QWEN_MODEL_PATH}" C-m
 
-# Pane 0.1: YOLOv8 (等 Qwen 加载后再启动)
-#          vLLM 加载模型需要 ~30s，加 60s 延迟确保 vLLM 先占稳显存
+# Pane 0.1: YOLOv8 (Qwen 健康检查通过后再启动，避免显存争抢)
 tmux send-keys -t ${session_name}:0.1 \
-    "echo 'Waiting 60s for vLLM to load Qwen3-VL first...' && sleep 60 && echo '=== YOLOv8 (port ${YOLOV8_PORT}) ===' && ${VLFM_PYTHON} -m myon.vlm.yolov8 --port ${YOLOV8_PORT} --weights ${YOLOV8_WEIGHTS}" C-m
+    "echo 'Waiting for Qwen3-VL...' && until curl -fsS http://localhost:${QWEN_PORT}/qwen_vl/health >/dev/null; do sleep 5; done; echo '=== YOLOv8 (port ${YOLOV8_PORT}) ===' && ${VLFM_PYTHON} -m myon.vlm.yolov8 --port ${YOLOV8_PORT} --weights ${YOLOV8_WEIGHTS}" C-m
 
-# Pane 0.2: MobileSAM (同样延迟启动)
+# Pane 0.2: MobileSAM (同样等待 Qwen 就绪)
 tmux send-keys -t ${session_name}:0.2 \
-    "echo 'Waiting 60s for vLLM to load Qwen3-VL first...' && sleep 60 && echo '=== MobileSAM (port ${SAM_PORT}) ===' && ${VLFM_PYTHON} -m vlfm.vlm.sam --port ${SAM_PORT}" C-m
+    "echo 'Waiting for Qwen3-VL...' && until curl -fsS http://localhost:${QWEN_PORT}/qwen_vl/health >/dev/null; do sleep 5; done; echo '=== MobileSAM (port ${SAM_PORT}) ===' && ${VLFM_PYTHON} -m vlfm.vlm.sam --port ${SAM_PORT}" C-m
 
 echo ""
 echo "Created tmux session '${session_name}'. 3 servers launching:"
-echo "  [0.0] Qwen3-VL     (port ${QWEN_PORT}) -- loading first (~30s)"
-echo "  [0.1] YOLOv8       (port ${YOLOV8_PORT}) -- starts after 60s delay"
-echo "  [0.2] MobileSAM    (port ${SAM_PORT}) -- starts after 60s delay"
+echo "  [0.0] Qwen3-VL     (port ${QWEN_PORT}) -- loading first"
+echo "  [0.1] YOLOv8       (port ${YOLOV8_PORT}) -- waits for Qwen health check"
+echo "  [0.2] MobileSAM    (port ${SAM_PORT}) -- waits for Qwen health check"
 echo ""
-echo "Total startup: ~90 seconds. Monitor with:"
+echo "Monitor startup with:"
 echo "  tmux attach-session -t ${session_name}"
 echo ""
 echo "To kill all servers:"

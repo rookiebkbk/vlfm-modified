@@ -51,12 +51,25 @@ habitat_baselines:
   force_torch_single_threaded: True
 
   eval:
-    split: "val"
+    split: "val_challenging"
 
   rl:
 
     policy:
       name: "HabitatSimplePolicyV2"
+      min_commit_steps: 4
+      switch_margin: 0.05
+      stuck_patience: 20
+      frontier_reached_radius: 0.45
+      frontier_progress_epsilon: 0.05
+      robot_motion_epsilon: 0.03
+      blocked_frontier_radius: 0.6
+      blocked_frontier_cooldown: 100
+      use_vqa_verification: True
+      vqa_trigger_threshold: 0.5
+      vqa_positive_yolo_threshold: 0.7
+      vqa_negative_yolo_threshold: 0.9
+      vqa_fail_open: False
 
     ppo:
       clip_param: 0.2

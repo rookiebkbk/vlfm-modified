@@ -6,9 +6,7 @@
     cd /root/objnav/vlfm && python myon/run.py
 
 启动前需要先运行模型服务:
-    python -m myon.vlm.yolov8 --port 12186 &
-    python -m vlfm.vlm.sam --port 12183 &
-    python -m vlfm.vlm.blip2itm --port 12182 &
+    bash scripts/launch_vlm_servers_itm_vqa.sh
 """
 
 import os
